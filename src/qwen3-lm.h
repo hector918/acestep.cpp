@@ -3,8 +3,10 @@
 // Loads from GGUF, supports prefill + decode, tied lm_head
 #pragma once
 
+#include "graph-arena.h"
 #include "qwen3-enc.h"  // Qwen3Layer, Qwen3Config, layer build helpers
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +31,7 @@ struct Qwen3LMConfig {
 // KV cache set (one per CFG path: conditional + unconditional)
 #define QW3LM_MAX_KV_SETS 32  // batch N * 2 (cond + uncond CFG)
 #define QW3LM_MAX_LAYERS  64
+#define QW3LM_GRAPH_NODES 16384
 
 struct Qwen3LM {
     Qwen3LMConfig cfg;
@@ -63,6 +66,14 @@ struct Qwen3LM {
     struct ggml_tensor *  kv_v[QW3LM_MAX_KV_SETS][QW3LM_MAX_LAYERS];
     int                   kv_pos[QW3LM_MAX_KV_SETS];
     int                   n_kv_sets;
+
+    // Persistent graph arenas, one per graph shape class: stable node
+    // addresses across rebuilds keep the backend CUDA graph cache hot,
+    // so decode steps replay a captured executable instead of paying
+    // one kernel launch per node.
+    GraphArena arena_prefill;
+    GraphArena arena_decode;
+    GraphArena arena_batch;
 };
 
 // Parse config.json integers, floats, bools
@@ -214,6 +225,11 @@ static void qw3lm_alloc_kv_cache(Qwen3LM * m, int n_sets) {
         exit(1);
     }
 
+    // Zero the buffer once: the attention window is padded past kv_pos
+    // and the masked tail must read finite values, never uninitialized
+    // F16 bit patterns that can decode to NaN.
+    ggml_backend_buffer_clear(m->kv_buf, 0);
+
     size_t kv_bytes = (size_t) n_sets * L * 2 * D * S * Nkv * ggml_type_size(GGML_TYPE_F16);
     fprintf(stderr, "[LM-KV] Allocated %d sets x %d layers (4D batched), %.1f MB\n", n_sets, L,
             (float) kv_bytes / (1024 * 1024));
@@ -222,7 +238,9 @@ static void qw3lm_alloc_kv_cache(Qwen3LM * m, int n_sets) {
 // Clear KV cache for a given set
 static void qw3lm_reset_kv(Qwen3LM * m, int kv_set) {
     m->kv_pos[kv_set] = 0;
-    // No need to zero memory: kv_pos tracks valid range
+    // No rezero needed: stale values past kv_pos are finite (zeroed at
+    // alloc, then overwritten by real K/V) and the mask carries neg inf
+    // over the padded attention tail.
 }
 
 // Copy KV cache from one set to another (for batched prefill sharing)
@@ -277,6 +295,13 @@ static bool qw3lm_load(Qwen3LM * m, const char * gguf_path, int max_seq_len, int
     // KV cache
     qw3lm_alloc_kv_cache(m, n_kv_sets > 0 ? n_kv_sets : 1);
 
+    // Persistent graph arenas
+    if (!graph_arena_init(&m->arena_prefill, QW3LM_GRAPH_NODES) ||
+        !graph_arena_init(&m->arena_decode, QW3LM_GRAPH_NODES) ||
+        !graph_arena_init(&m->arena_batch, QW3LM_GRAPH_NODES)) {
+        return false;
+    }
+
     return true;
 }
 
@@ -330,7 +355,7 @@ static struct ggml_tensor * qw3lm_build_attn(struct ggml_context * ctx,
                                              struct ggml_tensor *  cache_k,  // [D, max_seq, Nkv] f16
                                              struct ggml_tensor *  cache_v,  // [D, max_seq, Nkv] f16
                                              int                   kv_pos,
-                                             int                   kv_len,
+                                             int                   n_kv_pad,
                                              int                   n_tokens,
                                              bool                  use_flash_attn = true,
                                              bool                  clamp_fp16     = false) {
@@ -401,9 +426,12 @@ static struct ggml_tensor * qw3lm_build_attn(struct ggml_context * ctx,
     ggml_build_forward_expand(gf, ggml_cpy(ctx, k, k_dst));
     ggml_build_forward_expand(gf, ggml_cpy(ctx, v, v_dst));
 
-    // Read full KV from cache [0..kv_len]
-    struct ggml_tensor * k_full = ggml_view_3d(ctx, cache_k, D, kv_len, Nkv, nb1, nb2, 0);
-    struct ggml_tensor * v_full = ggml_view_3d(ctx, cache_v, D, kv_len, Nkv, nb1, nb2, 0);
+    // Read the padded [0, n_kv_pad) window from cache. The width stays
+    // constant across consecutive decode steps so the CUDA graph
+    // executable updates in place; the mask carries neg inf past the
+    // causal context so the padded tail contributes nothing.
+    struct ggml_tensor * k_full = ggml_view_3d(ctx, cache_k, D, n_kv_pad, Nkv, nb1, nb2, 0);
+    struct ggml_tensor * v_full = ggml_view_3d(ctx, cache_v, D, n_kv_pad, Nkv, nb1, nb2, 0);
 
     // Attention (flash or F32 manual fallback)
     float                scale = 1.0f / sqrtf((float) D);
@@ -433,24 +461,27 @@ static void qw3lm_forward(Qwen3LM * m, const int * token_ids, int n_tokens, int 
         return;
     }
 
-    // Graph context (generous fixed allocation)
-    size_t                  ctx_size = (size_t) 16384 * ggml_tensor_overhead() + ggml_graph_overhead();
-    struct ggml_init_params gp       = { ctx_size, NULL, true };
-    struct ggml_context *   ctx      = ggml_init(gp);
-    struct ggml_cgraph *    gf       = ggml_new_graph_custom(ctx, 16384, false);
+    // Attention window rounded up to 256 and clamped to the cache size:
+    // fixed shapes over spans of 256 decode steps keep the CUDA graph
+    // executable updatable in place.
+    const int n_kv_pad = std::min(c.max_seq_len, (int) GGML_PAD(kv_len, 256));
+
+    // Persistent arena per shape class: prefill (n_tokens > 1) and
+    // decode (n_tokens == 1) keep separate stable first node addresses.
+    GraphArena *          arena = (n_tokens > 1) ? &m->arena_prefill : &m->arena_decode;
+    struct ggml_context * ctx   = graph_arena_begin(arena);
+    struct ggml_cgraph *  gf    = ggml_new_graph_custom(ctx, QW3LM_GRAPH_NODES, false);
 
     // Inputs
     struct ggml_tensor * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
     ggml_set_name(positions, "positions");
     ggml_set_input(positions);
 
-    // Causal mask: needed for prefill (n_tokens > 1), not for decode (n_tokens == 1)
-    struct ggml_tensor * mask = NULL;
-    if (n_tokens > 1) {
-        mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv_len, n_tokens);
-        ggml_set_name(mask, "causal_mask");
-        ggml_set_input(mask);
-    }
+    // Causal mask over the padded window: kills the tail past the causal
+    // context on every path, prefill and decode alike.
+    struct ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv_pad, n_tokens);
+    ggml_set_name(mask, "causal_mask");
+    ggml_set_input(mask);
 
     // Embedding via ggml_get_rows (scheduler handles backend fallback)
     struct ggml_tensor * token_ids_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
@@ -469,7 +500,7 @@ static void qw3lm_forward(Qwen3LM * m, const int * token_ids, int n_tokens, int 
         // Self-attention with KV cache
         struct ggml_tensor * attn =
             qw3lm_build_attn(ctx, gf, c, ly, norm, positions, mask, m->kv_k[kv_set][l], m->kv_v[kv_set][l], kv_pos,
-                             kv_len, n_tokens, m->use_flash_attn, m->clamp_fp16);
+                             n_kv_pad, n_tokens, m->use_flash_attn, m->clamp_fp16);
 
         // Residual
         hidden = ggml_add(ctx, hidden, attn);
@@ -501,6 +532,7 @@ static void qw3lm_forward(Qwen3LM * m, const int * token_ids, int n_tokens, int 
     ggml_build_forward_expand(gf, lgt);
 
     // Schedule + allocate
+    ggml_backend_sched_reset(m->sched);
     if (!ggml_backend_sched_alloc_graph(m->sched, gf)) {
         fprintf(stderr, "[LM] FATAL: failed to allocate graph (prefill, %d tokens)\n", n_tokens);
         exit(1);
@@ -517,18 +549,19 @@ static void qw3lm_forward(Qwen3LM * m, const int * token_ids, int n_tokens, int 
         ggml_backend_tensor_set(positions, pos_data.data(), 0, n_tokens * sizeof(int));
     }
 
-    if (mask) {
-        // Causal mask: [kv_len, n_tokens]
-        // Row i (query at position kv_pos+i) can attend to columns [0..kv_pos+i]
-        std::vector<uint16_t> mask_data((size_t) kv_len * n_tokens);
+    {
+        // Causal mask: [n_kv_pad, n_tokens]
+        // Row i (query at position kv_pos+i) attends columns [0..kv_pos+i],
+        // everything past that carries neg inf, padded tail included.
+        std::vector<uint16_t> mask_data((size_t) n_kv_pad * n_tokens);
         for (int i = 0; i < n_tokens; i++) {
             int query_abs_pos = kv_pos + i;
-            for (int j = 0; j < kv_len; j++) {
-                float v                            = (j <= query_abs_pos) ? 0.0f : -INFINITY;
-                mask_data[(size_t) i * kv_len + j] = ggml_fp32_to_fp16(v);
+            for (int j = 0; j < n_kv_pad; j++) {
+                float v                              = (j <= query_abs_pos) ? 0.0f : -INFINITY;
+                mask_data[(size_t) i * n_kv_pad + j] = ggml_fp32_to_fp16(v);
             }
         }
-        ggml_backend_tensor_set(mask, mask_data.data(), 0, (size_t) kv_len * n_tokens * sizeof(uint16_t));
+        ggml_backend_tensor_set(mask, mask_data.data(), 0, (size_t) n_kv_pad * n_tokens * sizeof(uint16_t));
     }
 
     // Compute
@@ -537,11 +570,9 @@ static void qw3lm_forward(Qwen3LM * m, const int * token_ids, int n_tokens, int 
     // Read logits [V]
     ggml_backend_tensor_get(lgt, logits, 0, c.vocab_size * sizeof(float));
 
-    // Advance KV position
+    // Advance KV position. The arena and the sched allocation persist
+    // into the next forward.
     m->kv_pos[kv_set] += n_tokens;
-
-    ggml_backend_sched_reset(m->sched);
-    ggml_free(ctx);
 }
 
 // Batched decode forward: N tokens (1 per sequence), batched weight matmuls.
@@ -575,11 +606,14 @@ static void qw3lm_forward_batch(Qwen3LM *   m,
         }
     }
 
-    // Graph context (generous fixed allocation, ~6 MB, negligible vs model weights)
-    size_t ctx_size             = (size_t) 16384 * ggml_tensor_overhead() + ggml_graph_overhead_custom(16384, false);
-    struct ggml_init_params gp  = { ctx_size, NULL, true };
-    struct ggml_context *   ctx = ggml_init(gp);
-    struct ggml_cgraph *    gf  = ggml_new_graph_custom(ctx, 16384, false);
+    // Attention window rounded up to 256 and clamped to the cache size:
+    // fixed shapes over spans of 256 decode steps keep the CUDA graph
+    // executable updatable in place.
+    const int n_kv_pad = std::min(c.max_seq_len, (int) GGML_PAD(max_kv_len, 256));
+
+    // Persistent arena: stable node addresses across decode steps.
+    struct ggml_context * ctx = graph_arena_begin(&m->arena_batch);
+    struct ggml_cgraph *  gf  = ggml_new_graph_custom(ctx, QW3LM_GRAPH_NODES, false);
 
     // Embedding via ggml_get_rows (scheduler handles backend fallback)
     struct ggml_tensor * token_ids_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
@@ -591,9 +625,10 @@ static void qw3lm_forward_batch(Qwen3LM *   m,
     ggml_set_name(positions, "positions");
     ggml_set_input(positions);
 
-    // Batched attention mask: [max_kv_len, 1, 1, N] f16
-    // Per-element: 0 for valid KV positions, -inf for padding beyond elem kv_len
-    struct ggml_tensor * attn_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, max_kv_len, 1, 1, N);
+    // Batched attention mask: [n_kv_pad, 1, 1, N] f16
+    // Per-element: 0 for valid KV positions, neg inf past elem kv_len,
+    // padded tail included
+    struct ggml_tensor * attn_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv_pad, 1, 1, N);
     ggml_set_name(attn_mask, "attn_mask");
     ggml_set_input(attn_mask);
 
@@ -679,13 +714,13 @@ static void qw3lm_forward_batch(Qwen3LM *   m,
         // Q: [D, Nh, N] -> [D, 1, Nh, N] (n_batch=1, ne3=N for batched flash_attn)
         struct ggml_tensor * q4 = ggml_reshape_4d(ctx, q, D, 1, Nh, N);
 
-        // Batched KV read: [D, max_kv_len, Nkv, N] view of 4D cache
+        // Batched KV read: [D, n_kv_pad, Nkv, N] view of 4D cache
         int                  s0 = kv_sets[0];  // sets are always consecutive: [s0, s0+1, ..., s0+N-1]
         struct ggml_tensor * k_batch =
-            ggml_view_4d(ctx, m->kv_k4[l], D, max_kv_len, Nkv, N, m->kv_k4[l]->nb[1], m->kv_k4[l]->nb[2],
+            ggml_view_4d(ctx, m->kv_k4[l], D, n_kv_pad, Nkv, N, m->kv_k4[l]->nb[1], m->kv_k4[l]->nb[2],
                          m->kv_k4[l]->nb[3], (size_t) s0 * m->kv_k4[l]->nb[3]);
         struct ggml_tensor * v_batch =
-            ggml_view_4d(ctx, m->kv_v4[l], D, max_kv_len, Nkv, N, m->kv_v4[l]->nb[1], m->kv_v4[l]->nb[2],
+            ggml_view_4d(ctx, m->kv_v4[l], D, n_kv_pad, Nkv, N, m->kv_v4[l]->nb[1], m->kv_v4[l]->nb[2],
                          m->kv_v4[l]->nb[3], (size_t) s0 * m->kv_v4[l]->nb[3]);
 
         // Batched attention (flash or F32 manual fallback)
@@ -732,6 +767,7 @@ static void qw3lm_forward_batch(Qwen3LM *   m,
     ggml_build_forward_expand(gf, lgt);
 
     // Allocate
+    ggml_backend_sched_reset(m->sched);
     if (!ggml_backend_sched_alloc_graph(m->sched, gf)) {
         fprintf(stderr, "[LM] FATAL: failed to allocate graph (batch decode, N=%d)\n", N);
         exit(1);
@@ -749,14 +785,15 @@ static void qw3lm_forward_batch(Qwen3LM *   m,
         ggml_backend_tensor_set(positions, pos_data.data(), 0, N * sizeof(int));
     }
 
-    // Attention mask: [max_kv_len, 1, 1, N] f16
-    // 0.0 for valid KV positions, -inf for padding beyond each element's kv_len
+    // Attention mask: [n_kv_pad, 1, 1, N] f16
+    // 0.0 for valid KV positions, neg inf past each element's kv_len,
+    // padded tail included
     {
-        std::vector<uint16_t> mask_data((size_t) max_kv_len * N);
+        std::vector<uint16_t> mask_data((size_t) n_kv_pad * N);
         for (int i = 0; i < N; i++) {
             int kvl = m->kv_pos[kv_sets[i]] + 1;  // kv_len after write
-            for (int j = 0; j < max_kv_len; j++) {
-                mask_data[(size_t) i * max_kv_len + j] = ggml_fp32_to_fp16((j < kvl) ? 0.0f : -INFINITY);
+            for (int j = 0; j < n_kv_pad; j++) {
+                mask_data[(size_t) i * n_kv_pad + j] = ggml_fp32_to_fp16((j < kvl) ? 0.0f : -INFINITY);
             }
         }
         ggml_backend_tensor_set(attn_mask, mask_data.data(), 0, mask_data.size() * sizeof(uint16_t));
@@ -768,17 +805,18 @@ static void qw3lm_forward_batch(Qwen3LM *   m,
     // Read logits [out_V, N]
     ggml_backend_tensor_get(lgt, logits, 0, (size_t) out_V * N * sizeof(float));
 
-    // Advance all KV positions
+    // Advance all KV positions. The arena and the sched allocation
+    // persist into the next forward.
     for (int i = 0; i < N; i++) {
         m->kv_pos[kv_sets[i]]++;
     }
-
-    ggml_backend_sched_reset(m->sched);
-    ggml_free(ctx);
 }
 
 // Free all resources
 static void qw3lm_free(Qwen3LM * m) {
+    graph_arena_free(&m->arena_batch);
+    graph_arena_free(&m->arena_decode);
+    graph_arena_free(&m->arena_prefill);
     if (m->sched) {
         ggml_backend_sched_free(m->sched);
     }
