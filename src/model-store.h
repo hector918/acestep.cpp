@@ -8,6 +8,16 @@
 //       they have the budget for the full working set. Do not second-guess
 //       them by adding smart eviction rules.
 //
+//   --offload-vae (EVICT_VAE)
+//       Keep-loaded for everything except the VAE encoder and decoder.
+//       The VAE weights are small (~160 MB each) and load in ~2-3 s, but
+//       their tiled compute buffers are the single largest transient
+//       allocation in the whole pipeline (gigabytes, scales with
+//       --vae-chunk) and they stay attached to the module. Unloading the
+//       VAE after each use returns that budget while the expensive
+//       modules (LM + KV cache, DiT, text/cond encoders) stay resident.
+//       This is the keep-loaded variant for 8 GB cards.
+//
 //   default (EVICT_STRICT)
 //       Maximum VRAM optimisation. At most one GPU module resident at a
 //       time. VAE tiles never coexist with DiT weights or LM weights by
@@ -85,6 +95,7 @@ struct ModelKey {
 enum EvictPolicy {
     EVICT_STRICT,  // default: at most one GPU module resident at a time
     EVICT_NEVER,   // --keep-loaded: never evict, accumulate
+    EVICT_VAE,     // --offload-vae: keep everything except VAE enc/dec resident
 };
 
 // DiT metadata cached on the CPU: needed by text encoding and T resolution

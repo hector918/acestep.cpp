@@ -162,7 +162,10 @@ template <typename T> static T * cache_hit(ModelStore * s, const ModelKey & k) {
 ModelStore * store_create(EvictPolicy policy) {
     auto * s  = new ModelStore();
     s->policy = policy;
-    fprintf(stderr, "[Store] Created (policy=%s)\n", policy == EVICT_STRICT ? "STRICT" : "NEVER");
+    fprintf(stderr, "[Store] Created (policy=%s)\n",
+            policy == EVICT_STRICT ? "STRICT" :
+            policy == EVICT_NEVER  ? "NEVER" :
+                                     "VAE-OFFLOAD");
     return s;
 }
 
@@ -439,7 +442,21 @@ void store_release(ModelStore * s, void * handle) {
     GpuEntry & e = gpu_it->second;
     assert(e.refcount > 0);
     e.refcount--;
-    if (e.refcount == 0 && s->policy == EVICT_STRICT) {
+
+    // STRICT unloads everything at refcount 0. EVICT_VAE unloads only the
+    // VAE encoder/decoder: their weights are cheap to reload but their tiled
+    // compute buffers (attached to the module) are the largest transient
+    // allocation in the pipeline. Everything else follows NEVER semantics.
+    bool unload_now = false;
+    if (e.refcount == 0) {
+        if (s->policy == EVICT_STRICT) {
+            unload_now = true;
+        } else if (s->policy == EVICT_VAE) {
+            ModelKind kind = gpu_it->first.kind;
+            unload_now     = (kind == MODEL_VAE_ENC || kind == MODEL_VAE_DEC);
+        }
+    }
+    if (unload_now) {
         fprintf(stderr, "[Store] Unload %s (%.1f MB)\n", e.label, (float) e.bytes / (1024.0f * 1024.0f));
         e.deleter(e.ptr);
         s->handle_to_key.erase(hit);

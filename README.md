@@ -92,6 +92,8 @@ Adapter:
 
 Memory control:
   --keep-loaded           Keep models in VRAM between requests
+  --offload-vae           Keep all models loaded except VAE (implies --keep-loaded)
+  --preload               Load all models at startup (implies --keep-loaded)
   --vae-chunk <N>         Latent frames per tile (default: 1024)
   --vae-overlap <N>       Overlap frames per side (default: 64)
 

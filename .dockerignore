@@ -1,0 +1,10 @@
+# keep the docker build context lean; .git stays in (version.cmake needs it)
+build/
+build-*/
+models/*.gguf
+checkpoints/
+adapters/
+node_modules/
+*.tar.gz
+*.mp3
+*.wav

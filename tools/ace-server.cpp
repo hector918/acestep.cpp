@@ -196,6 +196,8 @@ static AceUnderstandParams g_und_params;
 // limits
 static int  g_max_batch   = 1;
 static bool g_keep_loaded = false;
+static bool g_preload     = false;
+static bool g_offload_vae = false;
 
 // job system: all compute endpoints create a job and return its ID
 // immediately. the worker thread processes jobs in FIFO order, stores
@@ -1563,6 +1565,98 @@ static void handle_props(const httplib::Request &, httplib::Response & res) {
     free(json);
 }
 
+// --preload: warm the store with every default registry module at startup.
+// Only meaningful under keep-loaded (EVICT_NEVER): the released handles keep
+// their modules resident, so the first request pays zero load cost and an
+// over-budget working set fails at boot instead of mid-song. Keys must match
+// the ones the pipelines build (see ace_lm_load / ace_synth_load), otherwise
+// the warm copy is a different store entry and the request loads its own.
+static void preload_models() {
+    Timer t;
+    int   n_ok   = 0;
+    int   n_fail = 0;
+
+    auto done = [&](void * p, const char * label) {
+        if (p) {
+            store_release(g_store, p);
+            n_ok++;
+        } else {
+            fprintf(stderr, "[Server] WARNING: preload %s failed\n", label);
+            n_fail++;
+        }
+    };
+
+    if (!g_registry.lm.empty()) {
+        ModelKey k{};
+        k.kind          = MODEL_LM;
+        k.path          = g_registry.lm[0].path;
+        k.max_seq       = g_lm_params.max_seq;
+        k.n_kv_sets     = 2 * g_lm_params.max_batch;  // must match ace_lm_load / ace_understand_load
+        k.adapter_scale = 1.0f;
+        done(store_require_lm(g_store, k), "LM");
+    }
+    if (!g_registry.text_enc.empty()) {
+        ModelKey k{};
+        k.kind          = MODEL_TEXT_ENC;
+        k.path          = g_registry.text_enc[0].path;
+        k.adapter_scale = 1.0f;
+        done(store_require_text_enc(g_store, k), "TextEnc");
+    }
+    if (!g_registry.dit.empty()) {
+        const std::string & dit_path = g_registry.dit[0].path;
+        {
+            ModelKey k{};
+            k.kind          = MODEL_DIT;
+            k.path          = dit_path;
+            k.adapter_scale = 1.0f;  // no adapter: matches the default synth key
+            done(store_require_dit(g_store, k), "DiT");
+        }
+        {
+            ModelKey k{};
+            k.kind          = MODEL_COND_ENC;
+            k.path          = dit_path;
+            k.adapter_scale = 1.0f;
+            done(store_require_cond_enc(g_store, k), "CondEnc");
+        }
+        {
+            ModelKey k{};
+            k.kind          = MODEL_FSQ_TOK;
+            k.path          = dit_path;
+            k.adapter_scale = 1.0f;
+            done(store_require_fsq_tok(g_store, k), "FSQ-Tok");
+        }
+        {
+            ModelKey k{};
+            k.kind          = MODEL_FSQ_DETOK;
+            k.path          = dit_path;
+            k.adapter_scale = 1.0f;
+            done(store_require_fsq_detok(g_store, k), "FSQ-Detok");
+        }
+    }
+    // Under --offload-vae the VAE modules unload as soon as the preload
+    // handle is released, so warming them would be a load-unload no-op.
+    if (!g_registry.vae.empty() && !g_offload_vae) {
+        const std::string & vae_path = g_registry.vae[0].path;
+        {
+            ModelKey k{};
+            k.kind          = MODEL_VAE_DEC;
+            k.path          = vae_path;
+            k.adapter_scale = 1.0f;
+            done(store_require_vae_dec(g_store, k), "VAE-Dec");
+        }
+        {
+            ModelKey k{};
+            k.kind          = MODEL_VAE_ENC;
+            k.path          = vae_path;
+            k.adapter_scale = 1.0f;
+            done(store_require_vae_enc(g_store, k), "VAE-Enc");
+        }
+    }
+
+    fprintf(stderr, "[Server] Preload: %d loaded, %d failed, %.1f MB resident, %.0f ms\n", n_ok, n_fail,
+            (float) store_vram_bytes(g_store) / (1024.0f * 1024.0f), t.ms());
+}
+
 static void usage(const char * prog) {
     AceLmParams    lm_d;
     AceSynthParams synth_d;
@@ -1581,6 +1675,8 @@ static void usage(const char * prog) {
             "\n"
             "Memory control:\n"
             "  --keep-loaded           Keep models in VRAM between requests\n"
+            "  --offload-vae           Keep all models loaded except VAE (implies --keep-loaded)\n"
+            "  --preload               Load all models at startup (implies --keep-loaded)\n"
             "  --vae-chunk <N>         Latent frames per tile (default: %d)\n"
             "  --vae-overlap <N>       Overlap frames per side (default: %d)\n"
             "\n"
@@ -1627,6 +1723,10 @@ int main(int argc, char ** argv) {
             g_synth_params.vae_overlap = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--keep-loaded")) {
             g_keep_loaded = true;
+        } else if (!strcmp(argv[i], "--offload-vae")) {
+            g_offload_vae = true;
+        } else if (!strcmp(argv[i], "--preload")) {
+            g_preload = true;
 
             // server
         } else if (!strcmp(argv[i], "--host") && i + 1 < argc) {
@@ -1657,6 +1757,14 @@ int main(int argc, char ** argv) {
             usage(argv[0]);
             return 1;
         }
+    }
+
+    // --preload and --offload-vae without keep-loaded are pointless: under
+    // STRICT each require would evict the previous module. Both imply
+    // keep-loaded semantics for the non-VAE working set.
+    if ((g_preload || g_offload_vae) && !g_keep_loaded) {
+        fprintf(stderr, "[Server] %s implies --keep-loaded\n", g_offload_vae ? "--offload-vae" : "--preload");
+        g_keep_loaded = true;
     }
 
     // --models is required
@@ -1732,8 +1840,22 @@ int main(int argc, char ** argv) {
 
     // central store: one policy for the whole server lifetime. STRICT keeps
     // at most one GPU module resident at a time; --keep-loaded flips it to
-    // NEVER and lets the working set accumulate across requests.
-    g_store = store_create(g_keep_loaded ? EVICT_NEVER : EVICT_STRICT);
+    // NEVER and lets the working set accumulate across requests;
+    // --offload-vae is NEVER for everything except the VAE modules, whose
+    // tile compute buffers are the biggest transient allocation.
+    EvictPolicy policy = EVICT_STRICT;
+    if (g_offload_vae) {
+        policy = EVICT_VAE;
+    } else if (g_keep_loaded) {
+        policy = EVICT_NEVER;
+    }
+    g_store = store_create(policy);
+
+    // warm the store before accepting requests: load failures surface here,
+    // at boot, instead of failing the first job.
+    if (g_preload) {
+        preload_models();
+    }
 
     // setup HTTP server
     httplib::Server svr;
