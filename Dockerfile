@@ -13,8 +13,12 @@
 #   docker run -d --name acestep-cpp \
 #     --gpus '"device=2"' --network llmnet -p 8085:8085 \
 #     -v /home/audio/gguf:/models \
+#     -v /home/audio/output:/output \
 #     --restart unless-stopped \
 #     acestep-cpp:v2
+#
+# IMPORTANT: do not append an ace-server command after the image name unless
+# you mean to override the tuned CMD below (that silently drops these flags).
 #
 # The default CMD below targets an 8 GB Pascal card with the full working
 # set resident except the VAE (--offload-vae): per-song cost is one VAE
@@ -42,4 +46,5 @@ COPY --from=build /src/acestep.cpp/build/*.so* /usr/local/lib/
 RUN ldconfig
 EXPOSE 8085
 CMD ["ace-server","--models","/models","--host","0.0.0.0","--port","8085", \
-     "--offload-vae","--preload","--max-seq","3072","--vae-chunk","128"]
+     "--offload-vae","--preload","--max-seq","3072","--vae-chunk","128", \
+     "--output-dir","/output","--output-max-files","500"]

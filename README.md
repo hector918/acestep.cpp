@@ -99,6 +99,8 @@ Memory control:
 
 Output:
   --mp3-bitrate <kbps>    MP3 bitrate (default: 128)
+  --output-dir <dir>      Also write finished tracks (+ .json metadata) here
+  --output-max-files <N>  Sweep oldest files beyond N (default: unlimited)
 
 Server:
   --host <addr>           Listen address (default: 127.0.0.1)

@@ -54,13 +54,16 @@
 #    pragma GCC diagnostic pop
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -198,6 +201,104 @@ static int  g_max_batch   = 1;
 static bool g_keep_loaded = false;
 static bool g_preload     = false;
 static bool g_offload_vae = false;
+
+// output archive: when --output-dir is set, every completed synth track is
+// also written to disk as <timestamp>_<jobid>_<n>.<ext> plus a sibling
+// .json carrying the enriched request (seed included, so any track can be
+// reproduced). --output-max-files sweeps oldest files after each write.
+// GET /files lists, GET /files?name=X downloads, DELETE /files?name=X
+// removes a file once a consumer has taken it.
+static std::string g_output_dir;
+static int         g_output_max_files = 0;  // 0 = no sweep
+static std::mutex  mtx_output;
+
+// Reject anything that could escape the output directory. Names we generate
+// are [0-9a-z_.-] only; a consumer echoing them back passes this untouched.
+static bool output_name_ok(const std::string & name) {
+    if (name.empty() || name[0] == '.') {
+        return false;
+    }
+    for (char c : name) {
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' ||
+                  c == '-';
+        if (!ok) {
+            return false;
+        }
+    }
+    return name.find("..") == std::string::npos;
+}
+
+// Caller holds mtx_output. Delete oldest files until the directory is back
+// under --output-max-files. Audio and json siblings count individually,
+// which keeps the bookkeeping trivial and still bounds the directory.
+static void output_sweep_locked() {
+    if (g_output_max_files <= 0) {
+        return;
+    }
+    namespace fs = std::filesystem;
+    std::vector<std::pair<fs::file_time_type, fs::path>> files;
+    std::error_code                                      ec;
+    for (const auto & e : fs::directory_iterator(g_output_dir, ec)) {
+        if (e.is_regular_file(ec)) {
+            files.emplace_back(e.last_write_time(ec), e.path());
+        }
+    }
+    if ((int) files.size() <= g_output_max_files) {
+        return;
+    }
+    std::sort(files.begin(), files.end());
+    int excess = (int) files.size() - g_output_max_files;
+    for (int i = 0; i < excess; i++) {
+        fs::remove(files[i].second, ec);
+        fprintf(stderr, "[Server] Sweep: removed %s\n", files[i].second.filename().string().c_str());
+    }
+}
+
+// Persist every non-empty track of a finished synth job. Failures only warn:
+// the in-memory job result is the source of truth, the archive is a bonus.
+static void output_write_tracks(const std::vector<std::string> & encoded,
+                                const char *                     ext,
+                                const std::vector<AceRequest> &  reqs,
+                                const std::string &              job_id) {
+    if (g_output_dir.empty()) {
+        return;
+    }
+    char      ts[32];
+    time_t    now = time(nullptr);
+    struct tm tmv;
+#ifdef _WIN32
+    localtime_s(&tmv, &now);
+#else
+    localtime_r(&now, &tmv);
+#endif
+    strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", &tmv);
+
+    std::lock_guard<std::mutex> lock(mtx_output);
+    for (size_t i = 0; i < encoded.size(); i++) {
+        if (encoded[i].empty()) {
+            continue;
+        }
+        std::string base  = std::string(ts) + "_" + job_id + "_" + std::to_string(i);
+        std::string apath = g_output_dir + "/" + base + ext;
+        FILE *      f     = fopen(apath.c_str(), "wb");
+        if (!f) {
+            fprintf(stderr, "[Server] WARNING: cannot write %s\n", apath.c_str());
+            continue;
+        }
+        fwrite(encoded[i].data(), 1, encoded[i].size(), f);
+        fclose(f);
+
+        std::string meta = request_to_json(&reqs[i < reqs.size() ? i : reqs.size() - 1]);
+        std::string jpath = g_output_dir + "/" + base + ".json";
+        FILE *      jf    = fopen(jpath.c_str(), "wb");
+        if (jf) {
+            fwrite(meta.data(), 1, meta.size(), jf);
+            fclose(jf);
+        }
+        fprintf(stderr, "[Server] Output: %s (%zu KB)\n", apath.c_str(), encoded[i].size() / 1024);
+    }
+    output_sweep_locked();
+}
 
 // job system: all compute endpoints create a job and return its ID
 // immediately. the worker thread processes jobs in FIFO order, stores
@@ -853,6 +954,9 @@ static void synth_worker(std::shared_ptr<Job>    job,
         }
         ace_audio_free(&audio[b]);
     }
+
+    // archive to --output-dir (no-op when unset), sweep afterwards
+    output_write_tracks(encoded, output_wav ? ".wav" : ".mp3", groups[0], job->id);
 
     // store result in job: every synth response is multipart, with one audio
     // part and one latent part per generated track, paired in wire order.
@@ -1680,6 +1784,10 @@ static void usage(const char * prog) {
             "  --vae-chunk <N>         Latent frames per tile (default: %d)\n"
             "  --vae-overlap <N>       Overlap frames per side (default: %d)\n"
             "\n"
+            "Output:\n"
+            "  --output-dir <dir>      Also write finished tracks (+ .json metadata) here\n"
+            "  --output-max-files <N>  Sweep oldest files beyond N (default: unlimited)\n"
+            "\n"
             "Server:\n"
             "  --host <addr>           Listen address (default: 127.0.0.1)\n"
             "  --port <N>              Listen port (default: 8080)\n"
@@ -1727,6 +1835,12 @@ int main(int argc, char ** argv) {
             g_offload_vae = true;
         } else if (!strcmp(argv[i], "--preload")) {
             g_preload = true;
+
+            // output archive
+        } else if (!strcmp(argv[i], "--output-dir") && i + 1 < argc) {
+            g_output_dir = argv[++i];
+        } else if (!strcmp(argv[i], "--output-max-files") && i + 1 < argc) {
+            g_output_max_files = atoi(argv[++i]);
 
             // server
         } else if (!strcmp(argv[i], "--host") && i + 1 < argc) {
@@ -1782,6 +1896,20 @@ int main(int argc, char ** argv) {
     if (!registry_scan(&g_registry, models_dir)) {
         fprintf(stderr, "[Server] ERROR: no GGUF models found in %s\n", models_dir);
         return 1;
+    }
+
+    // output archive directory (optional): create it up front so the first
+    // job's write cannot fail on a missing path.
+    if (!g_output_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(g_output_dir, ec);
+        if (ec) {
+            fprintf(stderr, "[Server] ERROR: cannot create output dir %s: %s\n", g_output_dir.c_str(),
+                    ec.message().c_str());
+            return 1;
+        }
+        fprintf(stderr, "[Server] Output dir: %s (max files: %s)\n", g_output_dir.c_str(),
+                g_output_max_files > 0 ? std::to_string(g_output_max_files).c_str() : "unlimited");
     }
 
     // scan adapters directory (optional)
@@ -1891,6 +2019,98 @@ int main(int argc, char ** argv) {
     });
     svr.Get("/props", handle_props);
     svr.Get("/logs", handle_logs);
+
+    // output archive endpoints: list, download, delete. 501 when no
+    // --output-dir is configured. Names are validated against traversal.
+    svr.Get("/files", [](const httplib::Request & req, httplib::Response & res) {
+        if (g_output_dir.empty()) {
+            json_error(res, 501, "No --output-dir configured");
+            return;
+        }
+        namespace fs = std::filesystem;
+        if (req.has_param("name")) {
+            std::string name = req.get_param_value("name");
+            if (!output_name_ok(name)) {
+                json_error(res, 400, "Invalid file name");
+                return;
+            }
+            std::string                 path = g_output_dir + "/" + name;
+            std::string                 body;
+            {
+                std::lock_guard<std::mutex> lock(mtx_output);
+                FILE * f = fopen(path.c_str(), "rb");
+                if (!f) {
+                    json_error(res, 404, "File not found");
+                    return;
+                }
+                fseek(f, 0, SEEK_END);
+                long sz = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                body.resize((size_t) sz);
+                size_t rd = fread(body.data(), 1, (size_t) sz, f);
+                fclose(f);
+                body.resize(rd);
+            }
+            const char * mime = "application/octet-stream";
+            if (name.size() > 4 && name.compare(name.size() - 4, 4, ".mp3") == 0) {
+                mime = "audio/mpeg";
+            } else if (name.size() > 4 && name.compare(name.size() - 4, 4, ".wav") == 0) {
+                mime = "audio/wav";
+            } else if (name.size() > 5 && name.compare(name.size() - 5, 5, ".json") == 0) {
+                mime = "application/json";
+            }
+            res.set_content(body, mime);
+            return;
+        }
+        // no name: JSON listing, newest first
+        std::vector<std::pair<fs::file_time_type, fs::path>> files;
+        {
+            std::lock_guard<std::mutex> lock(mtx_output);
+            std::error_code             ec;
+            for (const auto & e : fs::directory_iterator(g_output_dir, ec)) {
+                if (e.is_regular_file(ec)) {
+                    files.emplace_back(e.last_write_time(ec), e.path());
+                }
+            }
+        }
+        std::sort(files.begin(), files.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+        yyjson_mut_doc * doc  = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val * root = yyjson_mut_arr(doc);
+        yyjson_mut_doc_set_root(doc, root);
+        for (const auto & [mtime, path] : files) {
+            std::error_code  ec;
+            yyjson_mut_val * o = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, o, "name", path.filename().string().c_str());
+            yyjson_mut_obj_add_uint(doc, o, "size", (uint64_t) std::filesystem::file_size(path, ec));
+            yyjson_mut_arr_add_val(root, o);
+        }
+        char * json = yyjson_mut_write(doc, 0, NULL);
+        yyjson_mut_doc_free(doc);
+        res.set_content(json, "application/json");
+        free(json);
+    });
+    svr.Delete("/files", [](const httplib::Request & req, httplib::Response & res) {
+        if (g_output_dir.empty()) {
+            json_error(res, 501, "No --output-dir configured");
+            return;
+        }
+        if (!req.has_param("name")) {
+            json_error(res, 400, "Missing name parameter");
+            return;
+        }
+        std::string name = req.get_param_value("name");
+        if (!output_name_ok(name)) {
+            json_error(res, 400, "Invalid file name");
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mtx_output);
+        std::error_code             ec;
+        if (!std::filesystem::remove(g_output_dir + "/" + name, ec) || ec) {
+            json_error(res, 404, "File not found");
+            return;
+        }
+        res.set_content("{\"status\":\"deleted\"}", "application/json");
+    });
 
     // job system endpoints
     svr.Get("/job", [](const httplib::Request & req, httplib::Response & res) {
