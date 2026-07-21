@@ -633,10 +633,58 @@ static void json_error(httplib::Response & res, int status, const char * msg) {
     free(json);
 }
 
-// resolve model name: explicit request > already loaded > first in bucket
+// model pinning: --lm-model / --synth-model fix the model choice for the
+// whole server lifetime. Validated against the registry at startup (bad name
+// = startup error). Requests naming a DIFFERENT model are rejected with 409
+// before a job is created: under keep-loaded policies a second model would
+// stack on top of the resident one and blow the VRAM budget, so failing
+// loudly beats loading quietly. Empty = unpinned (legacy behavior).
+static std::string g_pin_lm;
+static std::string g_pin_dit;
+
+// find an entry by name, tolerating a missing .gguf suffix.
+static const ModelEntry * registry_resolve(const std::vector<ModelEntry> & bucket, const std::string & name) {
+    const ModelEntry * e = registry_find(bucket, name.c_str());
+    if (!e) {
+        e = registry_find(bucket, (name + ".gguf").c_str());
+    }
+    return e;
+}
+
+// handler-side pin gate. Returns false after sending the error response when
+// a non-empty requested name is unknown or conflicts with the pin.
+static bool check_pin(httplib::Response &             res,
+                      const std::vector<ModelEntry> & bucket,
+                      const std::string &             requested,
+                      const std::string &             pinned,
+                      const char *                    field) {
+    if (requested.empty()) {
+        return true;
+    }
+    const ModelEntry * e = registry_resolve(bucket, requested);
+    if (!e) {
+        std::string msg = std::string("Unknown ") + field + ": " + requested;
+        json_error(res, 400, msg.c_str());
+        return false;
+    }
+    if (!pinned.empty() && e->name != pinned) {
+        std::string msg = std::string(field) + " is pinned to '" + pinned + "' (server flag); restart to switch";
+        json_error(res, 409, msg.c_str());
+        return false;
+    }
+    return true;
+}
+
+// resolve model name: pinned > explicit request > already loaded > first in
+// bucket. Pinned wins unconditionally: conflicting requests were already
+// rejected by check_pin in the handler.
 static std::string resolve_name(const std::vector<ModelEntry> & bucket,
                                 const std::string &             requested,
-                                const std::string &             loaded) {
+                                const std::string &             loaded,
+                                const std::string &             pinned = std::string()) {
+    if (!pinned.empty()) {
+        return pinned;
+    }
     if (!requested.empty()) {
         return requested;
     }
@@ -657,7 +705,7 @@ static void lm_worker(std::shared_ptr<Job> job, AceRequest ace_req, int lm_batch
     }
 
     // Resolve model name and build per-request params from the template.
-    std::string        lm_name = resolve_name(g_registry.lm, ace_req.lm_model, g_loaded_lm);
+    std::string        lm_name = resolve_name(g_registry.lm, ace_req.lm_model, g_loaded_lm, g_pin_lm);
     const ModelEntry * entry   = registry_find(g_registry.lm, lm_name.c_str());
     if (!entry) {
         fprintf(stderr, "[Server] LM not found: %s\n", lm_name.c_str());
@@ -737,6 +785,9 @@ static void handle_lm(const httplib::Request & req, httplib::Response & res) {
         json_error(res, 400, "Caption is required");
         return;
     }
+    if (!check_pin(res, g_registry.lm, ace_req.lm_model, g_pin_lm, "lm_model")) {
+        return;
+    }
 
     // Resolve lm_mode string to integer mode used by ace_lm_generate.
     int mode;
@@ -807,7 +858,7 @@ static void synth_worker(std::shared_ptr<Job>    job,
     }
 
     // Resolve DiT, adapter, VAE and the text-encoder singleton.
-    std::string        dit_name = resolve_name(g_registry.dit, ace_reqs[0].synth_model, g_loaded_dit);
+    std::string        dit_name = resolve_name(g_registry.dit, ace_reqs[0].synth_model, g_loaded_dit, g_pin_dit);
     const ModelEntry * dit      = registry_find(g_registry.dit, dit_name.c_str());
     if (!dit) {
         fprintf(stderr, "[Server] DiT not found: %s\n", dit_name.c_str());
@@ -1111,6 +1162,15 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
         json_error(res, 400, "Caption is required");
         return;
     }
+    if (!check_pin(res, g_registry.dit, ace_reqs[0].synth_model, g_pin_dit, "synth_model")) {
+        return;
+    }
+    // An adapter merge produces a distinct DiT instance; with a pinned DiT
+    // that second instance would stack on top of the resident one.
+    if (!g_pin_dit.empty() && !ace_reqs[0].adapter.empty()) {
+        json_error(res, 409, "adapter selection is disabled while synth_model is pinned (server flag)");
+        return;
+    }
 
     // Output format from AceRequest.output_format. Converts the string to
     // (output_wav, wav_fmt) using the same parser the CLI uses.
@@ -1156,8 +1216,8 @@ static void understand_worker(std::shared_ptr<Job> job,
     }
 
     // Resolve LM + DiT (the DiT path carries the tokenizer weights) + VAE.
-    std::string        lm_name   = resolve_name(g_registry.lm, ace_req.lm_model, g_loaded_lm);
-    std::string        dit_name  = resolve_name(g_registry.dit, ace_req.synth_model, g_loaded_dit);
+    std::string        lm_name   = resolve_name(g_registry.lm, ace_req.lm_model, g_loaded_lm, g_pin_lm);
+    std::string        dit_name  = resolve_name(g_registry.dit, ace_req.synth_model, g_loaded_dit, g_pin_dit);
     std::string        vae_name  = resolve_name(g_registry.vae, ace_req.vae, g_loaded_vae);
     const ModelEntry * lm_entry  = registry_find(g_registry.lm, lm_name.c_str());
     const ModelEntry * dit       = registry_find(g_registry.dit, dit_name.c_str());
@@ -1297,6 +1357,11 @@ static void handle_understand(const httplib::Request & req, httplib::Response & 
 
     if (!src_interleaved && src_T_latent == 0) {
         json_error(res, 400, "Multipart: missing 'audio' or 'src_latents' part");
+        return;
+    }
+    if (!check_pin(res, g_registry.lm, ace_req.lm_model, g_pin_lm, "lm_model") ||
+        !check_pin(res, g_registry.dit, ace_req.synth_model, g_pin_dit, "synth_model")) {
+        free(src_interleaved);
         return;
     }
 
@@ -1690,10 +1755,13 @@ static void preload_models() {
         }
     };
 
-    if (!g_registry.lm.empty()) {
+    // Pinned models win over bucket order, matching resolve_name.
+    const ModelEntry * lm_e = g_registry.lm.empty() ? nullptr :
+                              (g_pin_lm.empty() ? &g_registry.lm[0] : registry_find(g_registry.lm, g_pin_lm.c_str()));
+    if (lm_e) {
         ModelKey k{};
         k.kind          = MODEL_LM;
-        k.path          = g_registry.lm[0].path;
+        k.path          = lm_e->path;
         k.max_seq       = g_lm_params.max_seq;
         k.n_kv_sets     = 2 * g_lm_params.max_batch;  // must match ace_lm_load / ace_understand_load
         k.adapter_scale = 1.0f;
@@ -1706,8 +1774,12 @@ static void preload_models() {
         k.adapter_scale = 1.0f;
         done(store_require_text_enc(g_store, k), "TextEnc");
     }
-    if (!g_registry.dit.empty()) {
-        const std::string & dit_path = g_registry.dit[0].path;
+    const ModelEntry * dit_e = g_registry.dit.empty() ?
+                                   nullptr :
+                                   (g_pin_dit.empty() ? &g_registry.dit[0] :
+                                                        registry_find(g_registry.dit, g_pin_dit.c_str()));
+    if (dit_e) {
+        const std::string & dit_path = dit_e->path;
         {
             ModelKey k{};
             k.kind          = MODEL_DIT;
@@ -1784,6 +1856,10 @@ static void usage(const char * prog) {
             "  --vae-chunk <N>         Latent frames per tile (default: %d)\n"
             "  --vae-overlap <N>       Overlap frames per side (default: %d)\n"
             "\n"
+            "Model pinning:\n"
+            "  --lm-model <name>       Pin the LM; requests naming another LM get 409\n"
+            "  --synth-model <name>    Pin the DiT; requests naming another DiT get 409\n"
+            "\n"
             "Output:\n"
             "  --output-dir <dir>      Also write finished tracks (+ .json metadata) here\n"
             "  --output-max-files <N>  Sweep oldest files beyond N (default: unlimited)\n"
@@ -1835,6 +1911,12 @@ int main(int argc, char ** argv) {
             g_offload_vae = true;
         } else if (!strcmp(argv[i], "--preload")) {
             g_preload = true;
+
+            // model pinning
+        } else if (!strcmp(argv[i], "--lm-model") && i + 1 < argc) {
+            g_pin_lm = argv[++i];
+        } else if (!strcmp(argv[i], "--synth-model") && i + 1 < argc) {
+            g_pin_dit = argv[++i];
 
             // output archive
         } else if (!strcmp(argv[i], "--output-dir") && i + 1 < argc) {
@@ -1895,6 +1977,29 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "[Server] Scanning models in %s\n", models_dir);
     if (!registry_scan(&g_registry, models_dir)) {
         fprintf(stderr, "[Server] ERROR: no GGUF models found in %s\n", models_dir);
+        return 1;
+    }
+
+    // validate model pins against the registry: a typo or a missing file is
+    // a configuration error, refuse to start rather than fall back silently.
+    auto validate_pin = [](std::string & pin, const std::vector<ModelEntry> & bucket, const char * what) -> bool {
+        if (pin.empty()) {
+            return true;
+        }
+        const ModelEntry * e = registry_resolve(bucket, pin);
+        if (!e) {
+            fprintf(stderr, "[Server] ERROR: --%s '%s' not found in registry. Available:\n", what, pin.c_str());
+            for (const auto & entry : bucket) {
+                fprintf(stderr, "[Server]   %s\n", entry.name.c_str());
+            }
+            return false;
+        }
+        pin = e->name;  // canonicalize (adds .gguf if omitted)
+        fprintf(stderr, "[Server] Pinned %s: %s\n", what, pin.c_str());
+        return true;
+    };
+    if (!validate_pin(g_pin_lm, g_registry.lm, "lm-model") ||
+        !validate_pin(g_pin_dit, g_registry.dit, "synth-model")) {
         return 1;
     }
 

@@ -97,6 +97,10 @@ Memory control:
   --vae-chunk <N>         Latent frames per tile (default: 1024)
   --vae-overlap <N>       Overlap frames per side (default: 64)
 
+Model pinning:
+  --lm-model <name>       Pin the LM; requests naming another LM get 409
+  --synth-model <name>    Pin the DiT; requests naming another DiT get 409
+
 Output:
   --mp3-bitrate <kbps>    MP3 bitrate (default: 128)
   --output-dir <dir>      Also write finished tracks (+ .json metadata) here

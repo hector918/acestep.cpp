@@ -47,4 +47,6 @@ RUN ldconfig
 EXPOSE 8085
 CMD ["ace-server","--models","/models","--host","0.0.0.0","--port","8085", \
      "--offload-vae","--preload","--max-seq","3072","--vae-chunk","128", \
+     "--lm-model","acestep-5Hz-lm-0.6B-Q8_0.gguf", \
+     "--synth-model","acestep-v15-sft-Q8_0.gguf", \
      "--output-dir","/output","--output-max-files","500"]

@@ -347,10 +347,14 @@ for p in body.split(b"--ace-batch-boundary"):
 |---|---|
 | `--offload-vae` | 除 VAE 外全部模型永久常驻（隐含 --keep-loaded）；每首歌只付 ~3s VAE 重载。8G 卡推荐 |
 | `--preload` | 启动时预加载全部模型（隐含 --keep-loaded），装不下启动即报错 |
+| `--lm-model <名>` | 钉死 LM（.gguf 后缀可省）。名字不在注册表 → 启动失败；请求指定其他 LM → `409` |
+| `--synth-model <名>` | 钉死 DiT，同上；钉死后带 `adapter` 的请求也会被 `409` 拒绝（防止第二个 DiT 实例叠显存） |
 | `--output-dir <dir>` | 产物落盘目录（启用 §8 的 /files API） |
 | `--output-max-files <N>` | 产物 sweep 上限 |
 | `--max-seq <N>` | LM KV cache 长度；每 1024 约占 235MB 显存（0.6B×2组），8G 卡建议 3072 |
 
-容器默认 CMD：`--offload-vae --preload --max-seq 3072 --vae-chunk 128 --output-dir /output --output-max-files 500`。
+未钉死时的模型选择顺序：请求 `lm_model`/`synth_model` > 本次运行上一次用过的 > 目录内**文件名字母序**第一个。常驻模式（keep-loaded/offload-vae）下模型从不驱逐，请求切换模型会叠加驻留——8G 卡务必用钉死参数防误触。
+
+容器默认 CMD：`--offload-vae --preload --max-seq 3072 --vae-chunk 128 --lm-model acestep-5Hz-lm-0.6B-Q8_0.gguf --synth-model acestep-v15-sft-Q8_0.gguf --output-dir /output --output-max-files 500`。
 
 生效验证：`docker logs acestep-cpp | grep -E "policy|Preload|Output dir"` 应见 `policy=VAE-OFFLOAD`、`Preload: 6 loaded, 0 failed`、`Output dir: /output`。
